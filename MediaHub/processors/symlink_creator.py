@@ -21,7 +21,7 @@ from threading import Event
 from MediaHub.processors.movie_processor import process_movie
 from MediaHub.processors.show_processor import process_show
 from MediaHub.utils.logging_utils import log_message
-from MediaHub.utils.file_utils import build_dest_index, is_anime_file, should_skip_processing
+from MediaHub.utils.file_utils import build_dest_index, is_anime_file, should_skip_processing, wait_for_upload_completion
 from MediaHub.monitor.symlink_cleanup import run_symlink_cleanup
 from MediaHub.utils.webdav_api import send_structured_message
 from MediaHub.config.config import *
@@ -77,9 +77,6 @@ class ProcessingManager:
 
     def _generate_destination_key(self, filename, dest_dir, force_show, force_movie):
         """Generate a key that represents the likely destination path"""
-        # Extract title and year for grouping
-        from MediaHub.utils.file_utils import clean_query
-
         try:
             parsed = clean_query(filename)
             title = parsed.get('title', filename)
@@ -282,6 +279,11 @@ class ProcessingManager:
                             if not os.path.exists(src_file):
                                 continue
 
+                            # Check upload completion
+                            if not wait_for_upload_completion(src_file, max_attempts=get_upload_max_attempts(), stability_time=get_upload_stability_wait()):
+                                log_message(f"Skipping {src_file}: Upload not confirmed complete", level="INFO")
+                                continue
+
                             normalized_src = normalize_file_path(src_file)
                             if processed_files_set and normalized_src in processed_files_set:
                                 total_skipped += 1
@@ -315,6 +317,11 @@ class ProcessingManager:
                 if should_skip_processing(file):
                     continue
 
+                # Check upload completion
+                if not wait_for_upload_completion(src_dir, max_attempts=get_upload_max_attempts(), stability_time=get_upload_stability_wait()):
+                    log_message(f"Skipping {src_dir}: Upload not confirmed complete", level="INFO")
+                    continue
+
                 # Check if already processed
                 if mode == 'create' and not force:
                     normalized_src = normalize_file_path(src_dir)
@@ -336,6 +343,11 @@ class ProcessingManager:
                             continue
 
                         src_file = os.path.join(root, file)
+
+                        # Check upload completion
+                        if not wait_for_upload_completion(src_file, max_attempts=get_upload_max_attempts(), stability_time=get_upload_stability_wait()):
+                            log_message(f"Skipping {src_file}: Upload not confirmed complete", level="INFO")
+                            continue
 
                         if mode == 'create' and not force:
                             normalized_src = normalize_file_path(src_file)
@@ -417,6 +429,11 @@ class ProcessingManager:
                     continue
 
                 src_file = os.path.join(root, file)
+
+                # Check upload completion
+                if not wait_for_upload_completion(src_file, max_attempts=get_upload_max_attempts(), stability_time=get_upload_stability_wait()):
+                    log_message(f"Skipping {src_file}: Upload not confirmed complete", level="INFO")
+                    continue
 
                 # Check if file was already processed
                 if mode == 'create' and not force:
@@ -501,6 +518,12 @@ def get_cached_selection():
 
 def process_file(args, force=False, batch_apply=False):
     src_file, root, file, dest_dir, actual_dir, tmdb_folder_id_enabled, rename_enabled, auto_select, dest_index, tmdb_id, imdb_id, tvdb_id, force_show, force_movie, season_number, episode_number, force_extra, skip, manual_search, reverse_index, processed_files_set = args
+
+    # Check upload completion unless --force is used
+    if not force:
+        if not wait_for_upload_completion(src_file, max_attempts=get_upload_max_attempts(), stability_time=get_upload_stability_wait()):
+            log_message(f"Skipping {src_file}: Upload not confirmed complete", level="WARNING")
+            return None
 
     if is_shutdown_requested():
         return
@@ -906,7 +929,7 @@ def process_file(args, force=False, batch_apply=False):
                     dest_file, tmdb_id, media_type, proper_name, year, episode_number_str, imdb_id, is_anime_genre, is_kids_content, language, quality, tvdb_id, league_id, sportsdb_event_id, sport_name, sport_round, sport_location, sport_session, sport_venue, sport_date = result
                     sport_city = sport_country = sport_time = None
                 elif len(result) >= 18:
-                    dest_file, sportsdb_event_id, media_type, proper_name, year, episode_number_str, imdb_id, is_anime_genre, is_kids_content, language, quality, tvdb_id, sportsdb_event_id_dup, sport_name, sport_round, sport_location, sport_session, sport_venue, sport_date = result
+                    dest_file, tmdb_id, media_type, proper_name, year, episode_number_str, imdb_id, is_anime_genre, is_kids_content, language, quality, tvdb_id, sportsdb_event_id, sport_name, sport_round, sport_location, sport_session, sport_venue, sport_date = result
                     # Use sportsdb_event_id as tmdb_id for sports content (legacy format)
                     tmdb_id = sportsdb_event_id
                     league_id = None
@@ -1035,537 +1058,4 @@ def process_file(args, force=False, batch_apply=False):
 
     # If we found an existing symlink for the same source, handle it first
     if existing_symlink_for_source and existing_symlink_for_source != dest_file:
-        # Found existing symlink for same source but with different name (rename scenario)
-        if not force:
-            # If not in force mode, check if this is just a rename case
-            existing_name = os.path.basename(existing_symlink_for_source)
-            new_name = os.path.basename(dest_file)
-            log_message(f"Found existing symlink for source with different name: {existing_name} -> {new_name}", level="INFO")
-
-            # If rename is enabled, we should update the symlink
-            if rename_enabled:
-                log_message(f"Renaming {existing_name}", level="INFO")
-                log_message(f"Updating existing symlink: {dest_file} -> {src_file} (was: {existing_symlink_for_source})", level="INFO")
-                os.remove(existing_symlink_for_source)
-            else:
-                # If rename is not enabled, keep the existing symlink
-                # For sports content, check SportsDB event ID instead of TMDB ID
-                if media_type == 'Sports':
-                    has_complete_metadata = bool(tmdb_id and media_type and proper_name and year)  # tmdb_id contains sportsdb_event_id for sports
-                else:
-                    has_complete_metadata = bool(tmdb_id and media_type and proper_name and year)
-
-                if has_complete_metadata:
-                    log_message(f"Symlink already exists for source file: {existing_symlink_for_source}", level="INFO")
-                    log_message(f"Adding existing symlink to database (rename disabled): {src_file} -> {existing_symlink_for_source}", level="DEBUG")
-                    # Save to database with all available metadata
-                    save_processed_file(
-                        src_file, existing_symlink_for_source, tmdb_id, season_number, None, None, None,
-                        media_type, proper_name, year, episode_number_str, imdb_id, is_anime_genre, 
-                        language, quality, tvdb_id,
-                        # Sports metadata (None if not sports)
-                        league_id if 'league_id' in locals() else None,
-                        sportsdb_event_id if 'sportsdb_event_id' in locals() else None,
-                        sport_name if 'sport_name' in locals() else None,
-                        sport_round if 'sport_round' in locals() else None,
-                        sport_location if 'sport_location' in locals() else None,
-                        sport_session if 'sport_session' in locals() else None,
-                        sport_venue if 'sport_venue' in locals() else None,
-                        sport_city if 'sport_city' in locals() else None,
-                        sport_country if 'sport_country' in locals() else None,
-                        sport_time if 'sport_time' in locals() else None,
-                        sport_date if 'sport_date' in locals() else None,
-                        # Movie metadata (None if not movie)
-                        original_language if 'original_language' in locals() else None,
-                        overview if 'overview' in locals() else None,
-                        runtime if 'runtime' in locals() else None,
-                        original_title if 'original_title' in locals() else None,
-                        status if 'status' in locals() else None,
-                        release_date if 'release_date' in locals() else None,
-                        first_air_date if 'first_air_date' in locals() else None,
-                        last_air_date if 'last_air_date' in locals() else None,
-                        genres if 'genres' in locals() else None,
-                        certification if 'certification' in locals() else None,
-                        episode_title if 'episode_title' in locals() else None,
-                        total_episodes if 'total_episodes' in locals() else None
-                    )
-                    return
-                else:
-                    log_message(f"Existing symlink found but metadata incomplete (rename disabled) - processing to extract metadata: {existing_symlink_for_source}", level="INFO")
-        else:
-            # In force mode, check if rename is enabled
-            if rename_enabled:
-                existing_name = os.path.basename(existing_symlink_for_source)
-                new_name = os.path.basename(dest_file)
-                log_message(f"Force mode with rename enabled: Found existing symlink for source with different name: {existing_name} -> {new_name}", level="INFO")
-                os.remove(existing_symlink_for_source)
-            else:
-                existing_name = os.path.basename(existing_symlink_for_source)
-                new_name = os.path.basename(dest_file)
-                log_message(f"Force mode with rename disabled: Found existing symlink for source with different name: {existing_name} -> {new_name}", level="INFO")
-                os.remove(existing_symlink_for_source)
-    elif existing_symlink_for_source == dest_file:
-        # For sports content, check SportsDB event ID instead of TMDB ID
-        if media_type == 'Sports':
-            has_complete_metadata = bool(tmdb_id and media_type and proper_name and year)  # tmdb_id contains sportsdb_event_id for sports
-        else:
-            has_complete_metadata = bool(tmdb_id and media_type and proper_name and year)
-
-        if has_complete_metadata:
-            log_message(f"Symlink already exists and is correct: {dest_file} -> {src_file}", level="INFO")
-            log_message(f"Adding correct symlink to database (fallback check): {src_file} -> {dest_file}", level="DEBUG")
-
-            # Save to database with all available metadata
-            save_processed_file(
-                src_file, dest_file, tmdb_id, season_number, None, None, None,
-                media_type, proper_name, year, episode_number_str, imdb_id, is_anime_genre, 
-                language, quality, tvdb_id,
-                # Sports metadata (None if not sports)
-                league_id if 'league_id' in locals() else None,
-                sportsdb_event_id if 'sportsdb_event_id' in locals() else None,
-                sport_name if 'sport_name' in locals() else None,
-                sport_round if 'sport_round' in locals() else None,
-                sport_location if 'sport_location' in locals() else None,
-                sport_session if 'sport_session' in locals() else None,
-                sport_venue if 'sport_venue' in locals() else None,
-                sport_city if 'sport_city' in locals() else None,
-                sport_country if 'sport_country' in locals() else None,
-                sport_time if 'sport_time' in locals() else None,
-                sport_date if 'sport_date' in locals() else None,
-                # Movie metadata (None if not movie)
-                original_language if 'original_language' in locals() else None,
-                overview if 'overview' in locals() else None,
-                runtime if 'runtime' in locals() else None,
-                original_title if 'original_title' in locals() else None,
-                status if 'status' in locals() else None,
-                release_date if 'release_date' in locals() else None,
-                first_air_date if 'first_air_date' in locals() else None,
-                last_air_date if 'last_air_date' in locals() else None,
-                genres if 'genres' in locals() else None,
-                certification if 'certification' in locals() else None,
-                episode_title if 'episode_title' in locals() else None,
-                total_episodes if 'total_episodes' in locals() else None
-            )
-            return
-        else:
-            log_message(f"Symlink exists but metadata incomplete (fallback) - processing to extract metadata: {dest_file} -> {src_file}", level="INFO")
-
-    # Check if symlink already exists at the exact destination path
-    if os.path.islink(dest_file):
-        existing_src = normalize_file_path(os.readlink(dest_file))
-        if existing_src == normalized_src_file:
-            # For sports content, check SportsDB event ID instead of TMDB ID
-            if media_type == 'Sports':
-                last_air_date if 'last_air_date' in locals() else None,
-                has_complete_metadata = bool(tmdb_id and media_type and proper_name and year)  # tmdb_id contains sportsdb_event_id for sports
-            else:
-                has_complete_metadata = bool(tmdb_id and media_type and proper_name and year)
-
-            if has_complete_metadata:
-                log_message(f"Symlink already exists and is correct: {dest_file} -> {src_file}", level="INFO")
-                log_message(f"Adding correct existing symlink to database: {src_file} -> {dest_file}", level="DEBUG")
-
-                # Save to database with all available metadata  
-                save_processed_file(
-                    src_file, dest_file, tmdb_id, season_number, None, None, None,
-                    media_type, proper_name, year, episode_number_str, imdb_id, is_anime_genre, 
-                    language, quality, tvdb_id,
-                    # Sports metadata (None if not sports)
-                    league_id if 'league_id' in locals() else None,
-                    sportsdb_event_id if 'sportsdb_event_id' in locals() else None,
-                    sport_name if 'sport_name' in locals() else None,
-                    sport_round if 'sport_round' in locals() else None,
-                    sport_location if 'sport_location' in locals() else None,
-                    sport_session if 'sport_session' in locals() else None,
-                    sport_venue if 'sport_venue' in locals() else None,
-                    sport_date if 'sport_date' in locals() else None,
-                    # Movie metadata (None if not movie)
-                    original_language if 'original_language' in locals() else None,
-                    overview if 'overview' in locals() else None,
-                    runtime if 'runtime' in locals() else None,
-                    original_title if 'original_title' in locals() else None,
-                    status if 'status' in locals() else None,
-                    release_date if 'release_date' in locals() else None,
-                    first_air_date if 'first_air_date' in locals() else None,
-                    last_air_date if 'last_air_date' in locals() else None,
-                    genres if 'genres' in locals() else None,
-                    certification if 'certification' in locals() else None,
-                    episode_title if 'episode_title' in locals() else None,
-                    total_episodes if 'total_episodes' in locals() else None
-                )
-                return
-            else:
-                log_message(f"Symlink exists but metadata incomplete - processing to extract metadata: {dest_file} -> {src_file}", level="INFO")
-        else:
-            # Instead of overwriting, create a versioned name for the new symlink
-            log_message(f"Symlink exists but points to different source, creating versioned name", level="INFO")
-            # The version numbering will be handled later in the code
-
-
-    if os.path.exists(dest_file) and not os.path.islink(dest_file):
-        log_message(f"File already exists at destination: {os.path.basename(dest_file)}", level="INFO")
-        return
-
-    # Check for filename conflicts and generate unique filename if needed
-    original_dest_file = dest_file
-    dest_file = generate_unique_filename(dest_file, src_file)
-    
-    if dest_file != original_dest_file:
-        log_message(f"Filename conflict detected, using versioned name: {os.path.basename(dest_file)}", level="INFO")
-
-    # Create symlink
-    try:
-        os.symlink(src_file, dest_file)
-        log_message(f"Created symlink: {dest_file} -> {src_file}", level="INFO")
-        log_message(f"Processed file: {src_file} to {dest_file}", level="INFO")
-
-        # Extract media information for structured message
-        new_folder_name = os.path.basename(os.path.dirname(dest_file))
-        new_filename = os.path.basename(dest_file)
-
-        # Determine media type based on folder structures
-        if not media_type or media_type == "Unknown":
-            media_type = "movie"
-            dest_parts = normalize_file_path(dest_file).split(os.sep)
-            is_tv_show = ("TV Shows" in dest_file or "Series" in dest_file or
-                         season_number is not None or
-                         any(part.lower().startswith('season ') for part in dest_parts) or
-                         any(part.lower() == 'extras' for part in dest_parts))
-            if is_tv_show:
-                media_type = "tv"
-
-        # Normalize media_type casing to ensure downstream checks work consistently
-        media_type = (media_type or "").lower()
-
-        # Prepare structured data for WebDavHub API
-        structured_data = {
-            "source_file": src_file,
-            "destination_file": dest_file,
-            "media_name": new_folder_name,
-            "filename": new_filename,
-            "media_type": media_type,
-            "tmdb_id": tmdb_id,
-            "season_number": season_number,
-            "episode_number": episode_number,
-            "timestamp": time.time(),
-            "force_mode": force if 'force' in locals() else False
-        }
-
-        # Add metadata for TV shows
-        if show_metadata and media_type == "tv":
-            structured_data.update({
-                "show_name": show_metadata.get('show_name'),
-                "proper_show_name": show_metadata.get('proper_show_name'),
-                "season_number": show_metadata.get('season_number'),
-                "episode_number": show_metadata.get('episode_number'),
-                "episode_identifier": show_metadata.get('episode_identifier'),
-                "episode_title": show_metadata.get('episode_title'),
-                "year": show_metadata.get('year'),
-                "is_anime_genre": show_metadata.get('is_anime_genre', False)
-            })
-
-        # Send structured data to WebDavHub API
-        try:
-            send_structured_message("symlink_created", structured_data)
-        except Exception as e:
-            log_message(f"Error sending symlink notification: {e}", level="DEBUG")
-
-        log_message(f"Adding newly created symlink to database: {src_file} -> {dest_file}", level="DEBUG")
-
-        # Save to database with all available metadata
-        save_processed_file(
-            src_file, dest_file, tmdb_id, season_number, None, None, None,
-            media_type, proper_name, year, episode_number_str, imdb_id, is_anime_genre, 
-            language, quality, tvdb_id, 
-            # Sports metadata (None if not sports)
-            league_id if 'league_id' in locals() else None,
-            sportsdb_event_id if 'sportsdb_event_id' in locals() else None,
-            sport_name if 'sport_name' in locals() else None,
-            sport_round if 'sport_round' in locals() else None,
-            sport_location if 'sport_location' in locals() else None,
-            sport_session if 'sport_session' in locals() else None,
-            sport_venue if 'sport_venue' in locals() else None,
-            sport_city if 'sport_city' in locals() else None,
-            sport_country if 'sport_country' in locals() else None,
-            sport_time if 'sport_time' in locals() else None,
-            sport_date if 'sport_date' in locals() else None,
-            # Movie metadata (None if not movie)
-            original_language if 'original_language' in locals() else None,
-            overview if 'overview' in locals() else None,
-            runtime if 'runtime' in locals() else None,
-            original_title if 'original_title' in locals() else None,
-            status if 'status' in locals() else None,
-            release_date if 'release_date' in locals() else None,
-            first_air_date if 'first_air_date' in locals() else None,
-            last_air_date if 'last_air_date' in locals() else None,
-            genres if 'genres' in locals() else None,
-            certification if 'certification' in locals() else None,
-            episode_title if 'episode_title' in locals() else None,
-            total_episodes if 'total_episodes' in locals() else None
-        )
-
-        # Handle cache updates for force mode vs normal mode
-        if force and 'old_symlink_info' in locals() and old_symlink_info:
-            try:
-                old_dest_path = old_symlink_info.get('path')
-                old_proper_name = old_symlink_info.get('proper_name')
-                old_year = old_symlink_info.get('year')
-
-                track_force_recreation(
-                    source_path=src_file,
-                    new_dest_path=dest_file,
-                    new_tmdb_id=tmdb_id,
-                    new_season_number=season_number,
-                    new_proper_name=proper_name,
-                    new_year=year,
-                    new_media_type=media_type,
-                    old_dest_path=old_dest_path,
-                    old_proper_name=old_proper_name,
-                    old_year=old_year
-                )
-            except Exception as e:
-                log_message(f"Error updating cache for force recreation: {e}", level="DEBUG")
-
-            _cleanup_old_symlink(old_symlink_info, dest_file)
-        else:
-            try:
-                track_file_addition(src_file, dest_file, tmdb_id, season_number)
-            except Exception as e:
-                log_message(f"Error updating cache for new symlink: {e}", level="DEBUG")
-
-        if plex_update() and plex_token():
-            update_plex_after_symlink(dest_file)
-
-        return (dest_file, True, src_file)
-
-    except FileExistsError:
-        log_message(f"File already exists: {dest_file}. Skipping symlink creation.", level="DEBUG")
-
-
-
-        if force and 'old_symlink_info' in locals():
-            _cleanup_old_symlink(old_symlink_info, dest_file)
-    except OSError as e:
-        log_message(f"Error creating symlink for {src_file}: {e}", level="ERROR")
-        track_file_failure(src_file, tmdb_id, season_number, "Symlink creation error", f"Error creating symlink: {e}")
-        if force and 'old_symlink_info' in locals():
-            _cleanup_old_symlink(old_symlink_info, dest_file)
-    except Exception as e:
-        error_message = f"Task failed with exception: {e}\n{traceback.format_exc()}"
-        log_message(error_message, level="ERROR")
-        track_file_failure(src_file, tmdb_id, season_number, "Unexpected error", error_message)
-        if force and 'old_symlink_info' in locals():
-            _cleanup_old_symlink(old_symlink_info, dest_file)
-
-    return None
-
-def signal_handler(signum, frame):
-    """Handle Ctrl+C gracefully"""
-    log_message("Received interrupt signal, stopping all processing...", level="WARNING")
-    set_shutdown()
-    # Don't call sys.exit(0) here - let the main thread handle cleanup
-
-def create_symlinks(src_dirs, dest_dir, auto_select=False, single_path=None, force=False, mode='create', tmdb_id=None, imdb_id=None, tvdb_id=None, force_show=False, force_movie=False, season_number=None, episode_number=None, force_extra=False, skip=False, batch_apply=False, manual_search=False, use_source_db=True):
-    """Create symlinks for media files from source directories to destination directory.
-
-    Args:
-        use_source_db: If True, use source files database to find unprocessed files (default: True)
-    """
-    global log_imported_db
-
-    # Only set up signal handlers if we're in the main thread
-    # This prevents "signal only works in main thread" errors when called from worker threads
-    try:
-        import threading
-        if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGINT, signal_handler)
-            if hasattr(signal, 'SIGTERM'):
-                signal.signal(signal.SIGTERM, signal_handler)
-    except Exception as e:
-        log_message(f"Could not set up signal handlers in create_symlinks: {e}", level="DEBUG")
-
-    if batch_apply:
-        reset_first_selection_cache()
-        log_message("Batch apply enabled - will cache first manual selection for subsequent files", level="INFO")
-    else:
-        reset_first_selection_cache()
-
-    # If skip is true, automatically set force to true for proper cleanup
-    if skip:
-        force = True
-        log_message("Skip flag detected - automatically enabling force mode for proper cleanup", level="INFO")
-
-    os.makedirs(dest_dir, exist_ok=True)
-    tmdb_folder_id_enabled = is_tmdb_folder_id_enabled()
-    rename_enabled = is_rename_enabled()
-    skip_extras_folder = is_skip_extras_folder_enabled()
-    imdb_structure_id_enabled = is_imdb_folder_id_enabled()
-
-    # Initialize database if in monitor mode
-    if mode == 'monitor' and not os.path.exists(PROCESS_DB):
-        initialize_file_database()
-
-    # Log source database status
-    if use_source_db:
-        if check_source_db_availability():
-            unprocessed_count = get_unprocessed_files_count()
-            log_message(f"Source files database available with {unprocessed_count} unprocessed files", level="INFO")
-        else:
-            log_message("Source files database not available, will use filesystem scanning", level="INFO")
-    else:
-        log_message("Source files database disabled, using filesystem scanning", level="INFO")
-
-    # Use single_path if provided, resolving symlinks first
-    if single_path:
-        original_single_path = single_path
-        resolved_single_path = resolve_symlink_to_source(single_path)
-        if resolved_single_path != original_single_path:
-            log_message(f"Resolved symlink for single_path: {original_single_path} -> {resolved_single_path}", level="INFO")
-        src_dirs = [resolved_single_path]
-
-    # Fast path for single file processing
-    is_single_file = single_path and os.path.isfile(single_path)
-
-    if auto_select:
-        # Use manager-coordinated parallel processing when auto-select is enabled
-        max_workers = get_max_processes()
-
-        # Initialize processing manager
-        manager = ProcessingManager(max_workers)
-        log_message(f"Initialized ProcessingManager with {max_workers} workers", level="INFO")
-
-        # Initialize destination index
-        dest_index = None
-        reverse_index = {}
-        processed_files_set = set()
-
-        # Manager: Scan and process simultaneously
-        try:
-            results = manager.process_files_truly_parallel(src_dirs, dest_dir, tmdb_folder_id_enabled, rename_enabled, auto_select, tmdb_id, imdb_id, tvdb_id, force_show, force_movie, season_number, episode_number, force_extra, skip, manual_search, mode, force, batch_apply, is_single_file, use_source_db)
-
-            # Process results
-            for result in results:
-                if result and isinstance(result, tuple) and len(result) == 3:
-                    dest_file, is_symlink, target_path = result
-                    if mode == 'monitor':
-                        update_single_file_index(dest_file, is_symlink, target_path)
-
-            # Show completion message
-            if is_shutdown_requested():
-                log_message("Processing interrupted by shutdown request", level="INFO")
-            else:
-                if is_single_file:
-                    log_message("Single file processing completed.", level="INFO")
-                else:
-                    log_message("All files processed successfully.", level="INFO")
-
-        except KeyboardInterrupt:
-            log_message("Processing interrupted by user (Ctrl+C)", level="INFO")
-            return
-
-    else:
-        dest_index = None
-
-        for src_dir in src_dirs:
-            if is_shutdown_requested():
-                log_message("Stopping further processing due to shutdown request.", level="WARNING")
-                return
-
-            try:
-                if os.path.isfile(src_dir):
-                    src_file = src_dir
-                    root = os.path.dirname(src_file)
-                    file = os.path.basename(src_file)
-                    actual_dir = os.path.basename(root)
-
-                    # Skip metadata and auxiliary files
-                    if should_skip_processing(file):
-                        continue
-
-                    # Skip destination index building for single files or force mode
-                    if dest_index is None:
-                        if is_single_file:
-                            log_message("Single file mode - skipping destination index building for faster startup", level="INFO")
-                            dest_index = set()
-                            reverse_index = {}
-                            processed_files_set = set()
-                        elif force:
-                            log_message("Force mode enabled - skipping destination index building for faster startup", level="INFO")
-                            dest_index = set()
-                            reverse_index = {}
-                            processed_files_set = set()
-                        else:
-                            log_message("Loading destination index from database...", level="INFO")
-                            if mode == 'monitor':
-                                dest_index = get_dest_index_from_db()
-                                reverse_index = {}
-                                processed_files_set = set()
-                            else:
-                                dest_index, reverse_index, processed_files_set = get_dest_index_from_processed_files()
-
-                    args = (src_file, root, file, dest_dir, actual_dir, tmdb_folder_id_enabled, rename_enabled, auto_select, dest_index, tmdb_id, imdb_id, tvdb_id, force_show, force_movie, season_number, episode_number, force_extra, skip, manual_search, reverse_index, processed_files_set)
-                    result = process_file(args, force, batch_apply)
-
-                    if result and isinstance(result, tuple) and len(result) == 3:
-                        dest_file, is_symlink, target_path = result
-                        if mode == 'monitor':
-                            update_single_file_index(dest_file, is_symlink, target_path)
-                else:
-                    # Handle directory
-                    actual_dir = os.path.basename(normalize_file_path(src_dir))
-                    log_message(f"Scanning source directory: {src_dir} (actual: {actual_dir})", level="INFO")
-
-                    # Skip destination index building for single files or force mode
-                    if dest_index is None:
-                        if is_single_file:
-                            log_message("Single file mode - skipping destination index building for faster startup", level="INFO")
-                            dest_index = set()
-                            reverse_index = {}
-                            processed_files_set = set()
-                        elif force:
-                            log_message("Force mode enabled - skipping destination index building for faster startup", level="INFO")
-                            dest_index = set()
-                            reverse_index = {}
-                            processed_files_set = set()
-                        else:
-                            log_message("Loading destination index from database...", level="INFO")
-                            if mode == 'monitor':
-                                dest_index = get_dest_index_from_db()
-                                reverse_index = {}
-                                processed_files_set = set()
-                            else:
-                                dest_index, reverse_index, processed_files_set = get_dest_index_from_processed_files()
-
-                    for root, _, files in os.walk(src_dir):
-                        for file in files:
-                            if is_shutdown_requested():
-                                log_message("Stopping further processing due to shutdown request.", level="WARNING")
-                                return
-
-                            # Skip metadata and auxiliary files
-                            if should_skip_processing(file):
-                                continue
-
-                            src_file = os.path.join(root, file)
-
-                            # Fast check using processed files set and reverse index
-                            if mode == 'create' and not force:
-                                if is_single_file:
-                                    if is_file_processed(src_file):
-                                        continue
-                                else:
-                                    normalized_src = normalize_file_path(src_file)
-                                    if processed_files_set and normalized_src in processed_files_set:
-                                        continue
-                                    else:
-                                        log_message(f"File not in processed files set, will process: {src_file}", level="DEBUG")
-
-                            args = (src_file, root, file, dest_dir, actual_dir, tmdb_folder_id_enabled, rename_enabled, auto_select, dest_index, tmdb_id, imdb_id, tvdb_id, force_show, force_movie, season_number, episode_number, force_extra, skip, manual_search, reverse_index, processed_files_set)
-                            result = process_file(args, force, batch_apply)
-
-                            if result and isinstance(result, tuple) and len(result) == 3:
-                                dest_file, is_symlink, target_path = result
-                                if mode == 'monitor':
-                                    update_single_file_index(dest_file, is_symlink, target_path)
-            except Exception as e:
-                log_message(f"Error processing directory {src_dir}: {str(e)}", level="ERROR")
+        # Found existing symlink for same source but with different
