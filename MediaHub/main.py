@@ -1,469 +1,59 @@
-import argparse
-import subprocess
 import os
-import sys
-import platform
-import time
-import psutil
-import signal
-import socket
+import argparse
 import threading
-import traceback
-import io
 import time
-from dotenv import load_dotenv
-
-# Configure UTF-8 encoding for stdout/stderr to handle Unicode characters
-if hasattr(sys.stdout, 'buffer'):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-if hasattr(sys.stderr, 'buffer'):
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
-# Append the parent directory to the system path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Local imports from MediaHub
-from MediaHub.config.config import *
+import sys
+import traceback
+import signal
 from MediaHub.utils.logging_utils import log_message
-from MediaHub.processors.db_utils import *
-from MediaHub.processors.symlink_creator import *
-from MediaHub.monitor.polling_monitor import *
-from MediaHub.processors.symlink_utils import *
-from MediaHub.utils.file_utils import resolve_symlink_to_source
-from MediaHub.utils.env_creator import ensure_env_file_exists, get_env_file_path
-from MediaHub.utils.dashboard_utils import is_dashboard_available, force_dashboard_recheck
-from MediaHub.utils.global_events import *
+from MediaHub.config.config import *
+from MediaHub.monitor.polling_monitor import start_polling_monitor
+from MediaHub.processors.symlink_creator import create_symlinks
+from MediaHub.utils.rclone_utils import wait_for_mount, check_rclone_mount, is_rclone_mount_enabled
+from MediaHub.processors.process_db import *
+from MediaHub.utils.global_events import terminate_flag, set_shutdown, terminate_subprocesses
+from MediaHub.utils.webdav_api import start_webdav_server
+from MediaHub.utils.plex_utils import check_dashboard_availability
 
-db_initialized = False
-
-POLLING_MONITOR_PATH = os.path.join(os.path.dirname(__file__), 'monitor', 'polling_monitor.py')
-LOCK_FILE = '/tmp/polling_monitor.lock' if platform.system() != 'Windows' else 'C:\\temp\\polling_monitor.lock'
-MONITOR_PID_FILE = '/tmp/monitor_pid.txt' if platform.system() != 'Windows' else 'C:\\temp\\monitor_pid.txt'
-LOCK_TIMEOUT = 3600
-
-# Set up global variables to track processes
-background_processes = []
-
-# Ensure .env file exists before trying to load it
-if not ensure_env_file_exists():
-    print("Failed to create .env file. Continuing with environment variables only.")
-
-# Load .env file
-db_env_path = get_env_file_path()
-load_dotenv(db_env_path)
-
-def wait_for_mount():
-    """Wait for the rclone mount to become available with minimal logging."""
-    initial_message = True
-    while True:
-        if check_rclone_mount():
-            if initial_message:
-                log_message("Mount is now available.", level="INFO")
-            return True
-
-        if initial_message:
-            log_message(f"Waiting for mount directory to become available...", level="INFO")
-            initial_message = False
-
-        time.sleep(is_mount_check_interval())
-
-def check_mount_points():
-    """Check if all configured mount points are accessible."""
-    try:
-        if is_rclone_mount_enabled():
-            return check_rclone_mount()
-        return True
-    except Exception as e:
-        log_message(f"Error checking mount points: {e}", level="ERROR")
-        return False
-
-def initialize_db_with_mount_check():
-    """Initialize database with mount point verification."""
-    try:
-        # Only initialize if not already initialized
-        initialize_db()
-
-        # Check if mount points are accessible
-        if is_rclone_mount_enabled() and not check_mount_points():
-            log_message("Mount points are not accessible. Please check your configuration.", level="ERROR")
-            return False
-        return True
-    except Exception as e:
-        log_message(f"Error during database initialization: {e}", level="ERROR")
-        return False
-
-def display_missing_files_with_mount_check(dest_dir):
-    """Display missing files after ensuring mount is available."""
-    try:
-        if not dest_dir:
-            log_message("Destination directory not provided", level="ERROR")
-            return []
-
-        if is_rclone_mount_enabled():
-            try:
-                wait_for_mount()
-            except Exception as e:
-                log_message(f"Error waiting for mount: {str(e)}", level="ERROR")
-                return []
-
-        if not os.path.exists(dest_dir):
-            log_message(f"Destination directory does not exist: {dest_dir}", level="ERROR")
-            return []
-
-        return display_missing_files(dest_dir)
-    except Exception as e:
-        log_message(f"Error in display_missing_files_with_mount_check: {str(e)}", level="ERROR")
-        log_message(traceback.format_exc(), level="DEBUG")
-        return []
-
-def ensure_windows_temp_directory():
-    """Create the C:\\temp directory if it does not exist on Windows."""
-    if platform.system() == 'Windows':
-        temp_dir = 'C:\\temp'
-        if not os.path.exists(temp_dir):
-            try:
-                os.makedirs(temp_dir)
-                log_message(f"Created directory: {temp_dir}", level="INFO")
-            except OSError as e:
-                log_message(f"Error creating directory {temp_dir}: {e}", level="ERROR")
-                exit(1)
-
-def is_process_running(pid):
-    """Check if a process with a given PID is still running."""
-    try:
-        return psutil.pid_exists(pid) and psutil.Process(pid).is_running()
-    except psutil.NoSuchProcess:
-        return False
-
-def create_lock_file():
-    """Create the lock file and write the process ID and timestamp."""
-    with open(LOCK_FILE, 'w') as lock_file:
-        lock_file.write(f"{os.getpid()}\n")
-        lock_file.write(f"{time.time()}\n")
-
-def check_lock_file():
-    """Check if a lock file exists and whether it's stale or the process is still running."""
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, 'r') as lock_file:
-                pid = int(lock_file.readline().strip())
-                lock_time = float(lock_file.readline().strip())
-
-                # Check if the process is still running
-                if is_process_running(pid):
-                    return True
-
-                # Check if the lock file is too old (stale)
-                if time.time() - lock_time > LOCK_TIMEOUT:
-                    log_message(f"Stale lock file found. Removing lock.", level="WARNING")
-                    os.remove(LOCK_FILE)
-                else:
-                    log_message(f"Lock file exists but process not running. Removing lock.", level="WARNING")
-                    os.remove(LOCK_FILE)
-        except (OSError, ValueError):
-            log_message(f"Error reading lock file. Removing lock.", level="ERROR")
-            os.remove(LOCK_FILE)
-    return False
-
-def remove_lock_file():
-    """Remove the lock file."""
-    if os.path.exists(LOCK_FILE):
-        try:
-            os.remove(LOCK_FILE)
-            log_message("Lock file removed successfully.", level="DEBUG")
-        except Exception as e:
-            log_message(f"Error removing lock file: {e}", level="ERROR")
-
-    if os.path.exists(MONITOR_PID_FILE):
-        try:
-            os.remove(MONITOR_PID_FILE)
-        except Exception as e:
-            log_message(f"Error removing monitor PID file: {e}", level="ERROR")
-
-def terminate_subprocesses():
-    """Terminate all subprocesses started by this script."""
-    global background_processes
-    log_message("Terminating all background processes...", level="INFO")
-
-    # First, check monitor pid file
-    if os.path.exists(MONITOR_PID_FILE):
-        try:
-            with open(MONITOR_PID_FILE, 'r') as f:
-                pid = int(f.read().strip())
-
-            if psutil.pid_exists(pid):
-                proc = psutil.Process(pid)
-                try:
-                    log_message(f"Terminating monitor process with PID {pid}", level="INFO")
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                    try:
-                        log_message(f"Force killing monitor process with PID {pid}", level="WARNING")
-                        proc.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-        except Exception as e:
-            log_message(f"Error terminating monitor process: {e}", level="ERROR")
-
-    # Handle tracked processes
-    for process in background_processes:
-        try:
-            if process.poll() is None:
-                log_message(f"Terminating process with PID {process.pid}", level="INFO")
-                if platform.system() == 'Windows':
-                    # On Windows, use taskkill to force terminate the process tree
-                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                else:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-        except Exception as e:
-            log_message(f"Error terminating process: {e}", level="ERROR")
-
-    # Try to terminate child processes using psutil
-    try:
-        current_process = psutil.Process(os.getpid())
-        children = current_process.children(recursive=True)
-
-        # First try to terminate gracefully
-        for child in children:
-            try:
-                log_message(f"Terminating child process {child.pid}", level="INFO")
-                child.terminate()
-            except psutil.NoSuchProcess:
-                continue
-
-        gone, still_alive = psutil.wait_procs(children, timeout=3)
-
-        for child in still_alive:
-            try:
-                log_message(f"Force killing child process {child.pid}", level="WARNING")
-                child.kill()
-            except psutil.NoSuchProcess:
-                pass
-    except Exception as e:
-        log_message(f"Error while terminating child processes: {str(e)}", level="ERROR")
-
-def handle_exit(signum, frame):
-    """Handle script termination and clean up."""
-    log_message("Received shutdown signal, exiting gracefully", level="INFO")
-    log_message("Terminating process and cleaning up lock file.", level="INFO")
-
-    set_shutdown()
-    time.sleep(0.5)
-
-    terminate_subprocesses()
-    remove_lock_file()
-
-    os._exit(0)
-
-def setup_process_priority():
-    """Set process priority to prevent overwhelming the system."""
-    try:
-        current_process = psutil.Process()
-        if platform.system() == 'Windows':
-            # Set to below normal priority on Windows
-            current_process.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
-            log_message("Set process priority to BELOW_NORMAL", level="DEBUG")
-        else:
-            # Set to nice value 10 on Unix (lower priority)
-            current_process.nice(10)
-            log_message("Set process nice value to 10", level="DEBUG")
-    except Exception as e:
-        log_message(f"Could not set process priority: {e}", level="WARNING")
-
-def setup_cpu_affinity():
-    """Set CPU affinity to limit MediaHub to specific CPU cores."""
-    try:
-        from MediaHub.config.config import get_max_cores
-        max_cores = get_max_cores()
-        total_cores = psutil.cpu_count()
-
-        if max_cores < total_cores:
-            allowed_cores = list(range(max_cores))
-            current_process = psutil.Process()
-            current_process.cpu_affinity(allowed_cores)
-
-            log_message(f"CPU affinity set to cores {allowed_cores} (using {max_cores} of {total_cores} cores)", level="INFO")
-
-            for child in current_process.children(recursive=True):
-                try:
-                    child.cpu_affinity(allowed_cores)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        else:
-            log_message(f"Using all {total_cores} CPU cores (MAX_CORES={max_cores})", level="INFO")
-
-    except Exception as e:
-        log_message(f"Could not set CPU affinity: {e}", level="WARNING")
-
-def log_system_configuration():
-    """Log system configuration at startup."""
-
-    max_processes = get_max_processes()
-    log_message(f"MAX_PROCESSES configured to use {max_processes} workers for I/O operations", level="INFO")
-    log_message(f"Using {max_processes} worker threads for parallel processing", level="INFO")
-
-    max_cores = get_max_cores()
-    cpu_cores = psutil.cpu_count()
-    log_message(f"MAX_CORES configured to use {max_cores} cores (CPU cores available: {cpu_cores})", level="INFO")
-
-    # Log dashboard configuration
-    dashboard_enabled = is_dashboard_notifications_enabled()
-
-    if dashboard_enabled:
-        dashboard_timeout = get_dashboard_timeout()
-        dashboard_check_interval = get_dashboard_check_interval()
-
-def start_polling_monitor():
-    """Start the polling monitor as a subprocess and track its PID."""
-    global background_processes
-
-    if check_lock_file():
-        return
-
-    create_lock_file()
-
-    log_message("Processing complete. Setting up directory monitoring.", level="INFO")
-
-    try:
-        python_command = 'python' if platform.system() == 'Windows' else 'python3'
-        process = subprocess.Popen([python_command, POLLING_MONITOR_PATH])
-
-        try:
-            current_process = psutil.Process()
-            affinity = current_process.cpu_affinity()
-            child_process = psutil.Process(process.pid)
-            child_process.cpu_affinity(affinity)
-            log_message(f"Set CPU affinity for polling monitor to cores {affinity}", level="DEBUG")
-        except Exception as e:
-            log_message(f"Could not set CPU affinity for polling monitor: {e}", level="DEBUG")
-
-        background_processes.append(process)
-
-        with open(MONITOR_PID_FILE, 'w') as f:
-            f.write(str(process.pid))
-
-        log_message(f"Started polling monitor with PID {process.pid}", level="INFO")
-
-        while not terminate_flag.is_set():
-            if process.poll() is not None:
-                log_message(f"Polling monitor exited with code {process.returncode}", level="INFO")
-                break
-            time.sleep(0.1)
-
-    except Exception as e:
-        log_message(f"Error running monitor script: {e}", level="ERROR")
-    finally:
-        remove_lock_file()
+LOCK_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'app.lock')
 
 def parse_season_episode(season_episode):
-    """Parse season and episode numbers from the format SxxExx."""
+    """Parse season and episode from string in format SxxExx or similar."""
     if not season_episode:
         return None, None
-
-    match = re.match(r'S(\d{1,2})E(\d{1,3})', season_episode.upper())
+    season_episode = season_episode.replace(' ', '').lower()
+    match = re.search(r's(\d{1,2})e(\d{1,2})', season_episode, re.IGNORECASE)
     if match:
         return int(match.group(1)), int(match.group(2))
     return None, None
 
-# CineSync WebDAV
-def is_port_in_use(port):
-    """Check if a port is already in use using multiple methods."""
+def remove_lock_file():
+    """Remove the lock file if it exists."""
+    if os.path.exists(LOCK_FILE):
+        try:
+            os.remove(LOCK_FILE)
+            log_message("Lock file removed successfully", level="INFO")
+        except Exception as e:
+            log_message(f"Error removing lock file: {e}", level="ERROR")
+
+def initialize_db_with_mount_check():
+    """Initialize database with mount check."""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            s.bind(('0.0.0.0', port))
-            return False
-    except socket.error:
-        pass
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            result = s.connect_ex(('127.0.0.1', port))
-            if result == 0:
-                return True
-    except:
-        pass
-
-    try:
-        for conn in psutil.net_connections(kind='inet'):
-            if conn.laddr.port == port and conn.status == 'LISTEN':
-                return True
-    except:
-        pass
-
-    return False
-
-def check_dashboard_availability():
-    """Check dashboard availability and log status."""
-    try:
-
-        if not is_dashboard_notifications_enabled():
-            log_message("Dashboard notifications are disabled", level="INFO")
-            return False
-
-        # Force a fresh check at startup
-        force_dashboard_recheck()
-
-        if is_dashboard_available():
-            log_message("Dashboard is available for notifications", level="INFO")
-            return True
-        else:
-            log_message("Dashboard is not available - notifications will be cached to avoid delays", level="WARNING")
-            return False
-
+        if is_rclone_mount_enabled() and not check_rclone_mount():
+            wait_for_mount()
+        initialize_file_database()
+        return True
     except Exception as e:
-        log_message(f"Error checking dashboard availability: {e}", level="ERROR")
+        log_message(f"Error initializing database: {e}", level="ERROR")
         return False
 
-def start_webdav_server():
-    """Start WebDavHub server if enabled."""
-    global background_processes
-
-    # Always start CineSync server
-    webdav_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'WebDavHub')
-    if platform.system() == 'Windows':
-        webdav_script = os.path.join(webdav_dir, 'cinesync.exe')
-    else:
-        webdav_script = os.path.join(webdav_dir, 'cinesync')
-    webdav_port = int(os.getenv('CINESYNC_API_PORT'))
-
-    # Check if the CineSync server is already running on the specified port
-    if is_port_in_use(webdav_port):
-        log_message(f"CineSync server is already running on port {webdav_port}", level="INFO")
-        # Check dashboard availability after confirming server is running
-        check_dashboard_availability()
-        return
-
-    if os.path.exists(webdav_script):
-        log_message("Starting CineSync server...", level="INFO")
-
-        try:
-            # Change to the WebDavHub directory and execute the script
-            current_dir = os.getcwd()
-            os.chdir(webdav_dir)
-            webdav_process = subprocess.Popen(["./" + os.path.basename(webdav_script)])
-            background_processes.append(webdav_process)
-            os.chdir(current_dir)
-
-            log_message(f"CineSync server started with PID: {webdav_process.pid}", level="INFO")
-
-            # Wait a moment for server to start, then check availability
-            time.sleep(2)
-            check_dashboard_availability()
-
-        except Exception as e:
-            log_message(f"Failed to start CineSync server: {e}", level="ERROR")
-    else:
-        log_message(f"CineSync executable not found at: {webdav_script}", level="ERROR")
-        # Check if dashboard is available anyway (might be running externally)
-        check_dashboard_availability()
+def signal_handler(signum, frame):
+    """Handle SIGINT and SIGTERM gracefully."""
+    log_message("Received interrupt signal, initiating shutdown...", level="WARNING")
+    set_shutdown()
+    terminate_subprocesses()
+    remove_lock_file()
+    sys.exit(0)
 
 def main(dest_dir):
     parser = argparse.ArgumentParser(description="Create symlinks for files from src_dirs in dest_dir.")
@@ -617,8 +207,7 @@ def main(dest_dir):
 
                         for source_file_path, expected_dest_path in missing_files_list:
                             log_message(f"Attempting to recreate symlink for missing file: {source_file_path}", level="INFO")
-                            create_symlinks(src_dirs=src_dirs, dest_dir=dest_dir, single_path=source_file_path, force=True, mode='create', auto_select=True, use_source_db=args.use_source_db
-                            )
+                            create_symlinks(src_dirs=src_dirs, dest_dir=dest_dir, single_path=source_file_path, force=True, mode='create', auto_select=True, use_source_db=args.use_source_db)
                     else:
                         log_message("No missing files found.", level="INFO")
 
@@ -632,7 +221,7 @@ def main(dest_dir):
             missing_files_thread.daemon = True
             missing_files_thread.start()
 
-            #Symlink cleanup
+            # Symlink cleanup
             cleanup_thread = threading.Thread(target=run_symlink_cleanup, args=(dest_dir,))
             cleanup_thread.daemon = True
             cleanup_thread.start()
@@ -653,9 +242,39 @@ def main(dest_dir):
     # Wait for mount before creating symlinks if needed
     if is_rclone_mount_enabled() and not check_rclone_mount():
         wait_for_mount()
+
     try:
         # Check if this is a single file operation for optimization
         is_single_file_operation = args.single_path and os.path.isfile(args.single_path) if args.single_path else False
+
+        # Check upload completion for single file operations (skip if --force is used)
+        if is_single_file_operation and not args.force:
+            from MediaHub.utils.file_utils import wait_for_upload_completion
+            from MediaHub.config.config import get_upload_max_attempts, get_upload_stability_wait
+            if not wait_for_upload_completion(args.single_path, max_attempts=get_upload_max_attempts(), stability_time=get_upload_stability_wait()):
+                log_message(f"Skipping {args.single_path}: Upload not confirmed complete", level="WARNING")
+                return  # Exit early for single file if upload incomplete
+
+        # Filter source directories for stable files in auto mode
+        filtered_src_dirs = []
+        if not args.single_path:  # Only filter for directory scanning
+            from MediaHub.utils.file_utils import wait_for_upload_completion
+            from MediaHub.config.config import get_upload_max_attempts, get_upload_stability_wait
+            for src_dir in src_dirs:
+                for root, _, files in os.walk(src_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        if not wait_for_upload_completion(file_path, max_attempts=get_upload_max_attempts(), stability_time=get_upload_stability_wait()):
+                            log_message(f"Skipping {file_path}: Upload not confirmed complete", level="INFO")
+                            continue
+                        filtered_src_dirs.append(src_dir)  # Add directory if at least one file is stable
+                        break  # Move to next directory after finding one stable file
+                if is_shutdown_requested():
+                    break
+            filtered_src_dirs = list(set(filtered_src_dirs))  # Remove duplicates
+            if not filtered_src_dirs:
+                log_message("No source directories contain stable files, skipping symlink creation", level="WARNING")
+                return
 
         # Start RealTime-Monitoring in main thread if not disabled and not single file operation
         if not args.disable_monitor and not is_single_file_operation:
@@ -665,7 +284,26 @@ def main(dest_dir):
             monitor_thread.daemon = True
             monitor_thread.start()
             time.sleep(2)
-            create_symlinks(src_dirs, dest_dir, auto_select=args.auto_select, single_path=args.single_path, force=args.force, mode='create', tmdb_id=args.tmdb, imdb_id=args.imdb, tvdb_id=args.tvdb, force_show=args.force_show, force_movie=args.force_movie, season_number=season_number, episode_number=episode_number, force_extra=args.force_extra, skip=args.skip, batch_apply=args.batch_apply, manual_search=args.manual_search, use_source_db=args.use_source_db)
+            create_symlinks(
+                src_dirs=filtered_src_dirs if not args.single_path else src_dirs,
+                dest_dir=dest_dir,
+                auto_select=args.auto_select,
+                single_path=args.single_path,
+                force=args.force,
+                mode='create',
+                tmdb_id=args.tmdb,
+                imdb_id=args.imdb,
+                tvdb_id=args.tvdb,
+                force_show=args.force_show,
+                force_movie=args.force_movie,
+                season_number=season_number,
+                episode_number=episode_number,
+                force_extra=args.force_extra,
+                skip=args.skip,
+                batch_apply=args.batch_apply,
+                manual_search=args.manual_search,
+                use_source_db=args.use_source_db
+            )
 
             while monitor_thread.is_alive() and not terminate_flag.is_set():
                 time.sleep(0.1)
@@ -675,7 +313,26 @@ def main(dest_dir):
         else:
             if is_single_file_operation:
                 log_message("Single file operation - skipping monitoring services for faster processing", level="INFO")
-            create_symlinks(src_dirs, dest_dir, auto_select=args.auto_select, single_path=args.single_path, force=args.force, mode='create', tmdb_id=args.tmdb, imdb_id=args.imdb, tvdb_id=args.tvdb, force_show=args.force_show, force_movie=args.force_movie, season_number=season_number, episode_number=episode_number, force_extra=args.force_extra, skip=args.skip, batch_apply=args.batch_apply, manual_search=args.manual_search, use_source_db=args.use_source_db)
+            create_symlinks(
+                src_dirs=src_dirs,
+                dest_dir=dest_dir,
+                auto_select=args.auto_select,
+                single_path=args.single_path,
+                force=args.force,
+                mode='create',
+                tmdb_id=args.tmdb,
+                imdb_id=args.imdb,
+                tvdb_id=args.tvdb,
+                force_show=args.force_show,
+                force_movie=args.force_movie,
+                season_number=season_number,
+                episode_number=episode_number,
+                force_extra=args.force_extra,
+                skip=args.skip,
+                batch_apply=args.batch_apply,
+                manual_search=args.manual_search,
+                use_source_db=args.use_source_db
+            )
     except KeyboardInterrupt:
         log_message("Keyboard interrupt received, cleaning up and exiting...", level="INFO")
         set_shutdown()
@@ -684,47 +341,13 @@ def main(dest_dir):
         sys.exit(0)
 
 if __name__ == "__main__":
-    # Make sure temp directory exists on Windows
-    ensure_windows_temp_directory()
+    signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
 
-    # Set up signal handlers before anything else
-    setup_signal_handlers()
-
-    # Set process priority to be system-friendly
-    setup_process_priority()
-
-    # Set CPU affinity to limit core usage
-    setup_cpu_affinity()
-
-    # Log system configuration at startup
-    log_system_configuration()
-
-    # Get directories and start main process
-    src_dirs_str = get_setting_with_client_lock('SOURCE_DIR', '', 'string')
     dest_dir = get_setting_with_client_lock('DESTINATION_DIR', '', 'string')
-    if not src_dirs_str or not dest_dir:
-        log_message("Source or destination directory not set.", level="ERROR")
-        exit(1)
-    src_dirs = src_dirs_str.split(',')
-
-    try:
-        main(dest_dir)
-    except KeyboardInterrupt:
-        log_message("Keyboard interrupt received, cleaning up and exiting...", level="INFO")
-        set_shutdown()
-        terminate_subprocesses()
-        remove_lock_file()
-        sys.exit(0)
-    except BrokenPipeError:
-        log_message("Broken pipe error detected, cleaning up and exiting...", level="INFO")
-        set_shutdown()
-        terminate_subprocesses()
-        remove_lock_file()
-        sys.exit(0)
-    except Exception as e:
-        log_message(f"Unhandled exception: {str(e)}", level="ERROR")
-        log_message(traceback.format_exc(), level="DEBUG")
-        set_shutdown()
-        terminate_subprocesses()
-        remove_lock_file()
+    if not dest_dir:
+        log_message("DESTINATION_DIR environment variable not set.", level="ERROR")
         sys.exit(1)
+
+    main(dest_dir)
