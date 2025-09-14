@@ -696,13 +696,39 @@ def _is_extras_by_name(filename: str, file_path: str = None) -> bool:
 def is_extras_file(file: str, file_path: str, is_movie: bool = False) -> bool:
     """
     Determine if the file is an extra based on size limits and name patterns.
-
     Args:
         file: Filename to check
         file_path: Full path to the file
         is_movie: True if processing movie files, False for show files
-
     Returns:
         bool: True if file should be skipped based on size limits or name patterns
     """
     if not isinstance(file, str):
+        return False
+    
+    try:
+        # Get file size in MB
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        
+        # Check size limit from config
+        max_size = get_extras_max_size()
+        if file_size_mb > max_size:
+            return False
+            
+        # Check if filename matches extras patterns
+        extras_patterns = [
+            'trailer', 'behind the scenes', 'deleted scenes', 'gag reel',
+            'interview', 'commentary', 'making of', 'featurette', 'extra',
+            'bonus', 'bloopers', 'outtakes'
+        ]
+        
+        filename_lower = file.lower()
+        for pattern in extras_patterns:
+            if pattern in filename_lower:
+                return True
+                
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error checking extras file {file}: {e}")
+        return False
