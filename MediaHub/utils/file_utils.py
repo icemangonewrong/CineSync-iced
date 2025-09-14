@@ -14,7 +14,7 @@ from MediaHub.utils.parser.parse_anime import is_anime_filename
 # Cache for parsed metadata to avoid redundant parsing
 _metadata_cache = {}
 
-# Cache for keywords dataz
+# Cache for keywords data
 _keywords_cache = None
 
 # ============================================================================
@@ -116,24 +116,6 @@ def parse_media_file(filename: str) -> Dict[str, Any]:
         - container: File container format
         - hdr: HDR information
         - is_proper: Whether it's a proper release
-
-    Examples:
-        >>> parse_media_file("1923.S02E05.Only.Gunshots.to.GuideUs.1080p.Webrip.10bit.DDP5.1.x265-HODL.mkv")
-        {
-            "title": "1923",
-            "year": None,
-            "season": 2,
-            "episode": 5,
-            "episode_title": "Only Gunshots to GuideUs",
-            "resolution": "1080p",
-            "quality_source": "Webrip",
-            "video_codec": "X265",
-            "audio_codecs": ["DDP"],
-            "audio_channels": ["5.1"],
-            "release_group": "HODL",
-            "container": "mkv",
-            "is_anime": false
-        }
     """
     try:
         # Use the unified parser
@@ -593,7 +575,7 @@ def get_source_directory_from_symlink(file_path: str) -> str:
         return os.path.dirname(file_path) if file_path else ""
 
 # ============================================================================
-# UTILITY FUNCTIONS (Keep these as they are utility functions)
+# UTILITY FUNCTIONS
 # ============================================================================
 
 def sanitize_windows_filename(filename: str) -> str:
@@ -696,39 +678,320 @@ def _is_extras_by_name(filename: str, file_path: str = None) -> bool:
 def is_extras_file(file: str, file_path: str, is_movie: bool = False) -> bool:
     """
     Determine if the file is an extra based on size limits and name patterns.
+
     Args:
         file: Filename to check
         file_path: Full path to the file
         is_movie: True if processing movie files, False for show files
+
     Returns:
         bool: True if file should be skipped based on size limits or name patterns
     """
-    if not isinstance(file, str):
+    if not isinstance(file, str) or not isinstance(file_path, str):
         return False
-    
+
+    if not os.path.exists(file_path):
+        return False
+
+    if os.path.islink(file_path):
+        return False
+
+    # Use centralized function to check if file should be skipped
+    if should_skip_processing(file):
+        return False
+
+    # Never consider .srt and .strm files as extras regardless of size
+    # These files are legitimately small and should always be processed
+    if file.lower().endswith(('.srt', '.strm')):
+        return False
+
+    if _is_extras_by_name(file, file_path):
+        log_message(f"File identified as extra by name pattern: {file}", level="DEBUG")
+        return True
+
     try:
-        # Get file size in MB
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        
-        # Check size limit from config
-        max_size = get_extras_max_size()
-        if file_size_mb > max_size:
-            return False
-            
-        # Check if filename matches extras patterns
-        extras_patterns = [
-            'trailer', 'behind the scenes', 'deleted scenes', 'gag reel',
-            'interview', 'commentary', 'making of', 'featurette', 'extra',
-            'bonus', 'bloopers', 'outtakes'
-        ]
-        
-        filename_lower = file.lower()
-        for pattern in extras_patterns:
-            if pattern in filename_lower:
-                return True
-                
+
+        is_4k = ('2160' in file or
+                 re.search(r'\b4k\b', file, re.IGNORECASE) or
+                 'UHD' in file.upper() or
+                 'UltraHD' in file)
+
+        if not is_4k:
+            try:
+                parent_dir = os.path.dirname(file_path)
+                folder_name = os.path.basename(parent_dir)
+
+                if (
+                    '2160' in folder_name or
+                    re.search(r'\b4k\b', folder_name, re.IGNORECASE) or
+                    'UHD' in folder_name.upper() or
+                    'UltraHD' in folder_name
+                ):
+                    is_4k = True
+                else:
+                    folder_resolution = extract_resolution_from_folder(parent_dir)
+                    if isinstance(folder_resolution, str):
+                        if (
+                            '2160' in folder_resolution or
+                            re.search(r'\b4k\b', folder_resolution, re.IGNORECASE) or
+                            'UHD' in folder_resolution.upper() or
+                            'UltraHD' in folder_resolution
+                        ):
+                            is_4k = True
+            except Exception:
+                pass
+
+        if is_movie:
+            if is_4k:
+                size_limit = get_4k_movie_extras_size_limit()
+            else:
+                size_limit = get_movie_extras_size_limit()
+        else:
+            if is_4k:
+                size_limit = get_4k_show_extras_size_limit()
+            else:
+                size_limit = get_show_extras_size_limit()
+
+        return file_size_mb <= size_limit
+
+    except (OSError, IOError) as e:
+        log_message(f"Error checking file size for {file_path}: {e}", level="ERROR")
         return False
-        
+
+# ============================================================================
+# ADDITIONAL UTILITY FUNCTIONS
+# ============================================================================
+
+def standardize_title(title: str, check_word_count: bool = True) -> str:
+    """
+    Standardize title by replacing special characters with alternatives.
+
+    Args:
+        title: Title to standardize
+        check_word_count: Whether to check word count before standardizing
+
+    Returns:
+        Standardized title
+    """
+    if not isinstance(title, str):
+        return ""
+
+    replacements = {
+        '0': 'o', '1': 'i', '4': 'a', '5': 's', '7': 't', '9': 'g',
+        '@': 'a', '#': 'h', '$': 's', '%': 'p', '&': 'and', '*': 'x',
+        '3': 'e', '8': 'b', '6': 'u'
+    }
+
+    def replacement_func(match):
+        char = match.group(0)
+        return replacements.get(char, char)
+
+    if check_word_count:
+        # Count words with non-standard characters
+        words = re.findall(r'\b\w+\b', title)
+        affected_count = sum(
+            1 for word in words if re.search(r'[014579@#$%&*3]', word)
+        )
+
+        # Standardize title if more than 4 words are affected
+        if affected_count > 4:
+            standardized_title = re.sub(r'[0-9@#$%&*3]', replacement_func, title)
+        else:
+            standardized_title = title
+    else:
+        # Always standardize title
+        standardized_title = re.sub(r'[0-9@#$%&*3]', replacement_func, title)
+
+    # Clean up extra spaces
+    standardized_title = re.sub(r'\s+', ' ', standardized_title).strip()
+    return standardized_title
+
+def remove_genre_names(query: str) -> str:
+    """
+    Remove common genre names from query string.
+
+    Args:
+        query: Query string to clean
+
+    Returns:
+        Query with genre names removed
+    """
+    if not isinstance(query, str):
+        return ""
+
+    genre_names = [
+        'Action', 'Comedy', 'Drama', 'Thriller', 'Horror', 'Romance', 'Adventure', 'Sci-Fi',
+        'Fantasy', 'Mystery', 'Crime', 'Documentary', 'Animation', 'Family', 'Music', 'War',
+        'Western', 'History', 'Biography'
+    ]
+
+    for genre in genre_names:
+        query = re.sub(r'\b' + re.escape(genre) + r'\b', '', query, flags=re.IGNORECASE)
+
+    query = re.sub(r'\s+', ' ', query).strip()
+    return query
+
+def check_existing_variations(name: str, year: Optional[int], dest_dir: str) -> Optional[str]:
+    """
+    Check for existing variations of a media title in the destination directory.
+
+    Args:
+        name: Media title to search for
+        year: Optional year for better matching
+        dest_dir: Destination directory to search in
+
+    Returns:
+        Matching directory name if found, None otherwise
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    if not os.path.exists(dest_dir):
+        log_message(f"Destination directory does not exist: {dest_dir}", level="WARNING")
+        return None
+
+    normalized_query = normalize_query(name)
+    log_message(f"Checking existing variations for: {name} ({year})", level="DEBUG")
+
+    partial_matches = []
+
+    try:
+        # Define MAX_WORD_LENGTH_DIFF if not available from config
+        MAX_WORD_LENGTH_DIFF = getattr(builtins, 'MAX_WORD_LENGTH_DIFF', 10)
+
+        for root, dirs, _ in os.walk(dest_dir):
+            for d in dirs:
+                normalized_d = normalize_query(d)
+                d_year = extract_year(d)
+
+                # Prioritize exact matches
+                if normalized_query == normalized_d and (d_year == year or not year or not d_year):
+                    log_message(f"Found exact matching variation: {d}", level="DEBUG")
+                    return d
+
+                # Collect partial matches with stricter criteria
+                length_diff = abs(len(normalized_query) - len(normalized_d))
+                if (normalized_query in normalized_d or normalized_d in normalized_query) and length_diff < MAX_WORD_LENGTH_DIFF:
+                    partial_matches.append((d, d_year))
+
+        if partial_matches:
+            # Select the best partial match based on length and year
+            closest_match = min(partial_matches, key=lambda x: (len(x[0]), x[1] != year if year else 0))
+            log_message(f"Found closest matching variation: {closest_match[0]}", level="DEBUG")
+            return closest_match[0]
+
     except Exception as e:
-        logger.error(f"Error checking extras file {file}: {e}")
-        return False
+        log_message(f"Error checking existing variations: {e}", level="ERROR")
+        return None
+
+    log_message(f"No matching variations found for: {name} ({year})", level="DEBUG")
+    return None
+
+def build_dest_index(dest_dir: str) -> Set[str]:
+    """
+    Build an index of all files and directories in the destination directory.
+
+    Args:
+        dest_dir: Directory to index
+
+    Returns:
+        Set of all file and directory paths
+    """
+    if not isinstance(dest_dir, str) or not os.path.exists(dest_dir):
+        log_message(f"Invalid destination directory: {dest_dir}", level="WARNING")
+        return set()
+
+    dest_index = set()
+    try:
+        for root, dirs, files in os.walk(dest_dir):
+            for name in dirs + files:
+                dest_index.add(os.path.join(root, name))
+    except Exception as e:
+        log_message(f"Error building destination index: {e}", level="ERROR")
+
+    return dest_index
+
+def extract_resolution_from_folder(folder_path: str) -> Optional[str]:
+    """
+    Extract resolution from folder path using the unified parser.
+
+    Args:
+        folder_path: Folder path to extract resolution from
+
+    Returns:
+        Resolution string if found, None otherwise
+    """
+    if not isinstance(folder_path, str):
+        return None
+
+    # Try to extract from the folder name itself
+    folder_name = os.path.basename(folder_path)
+    try:
+        metadata = extract_all_metadata(folder_name)
+        if metadata.resolution:
+            return metadata.resolution
+    except Exception:
+        pass
+
+    # Try to extract from parent folder names
+    path_parts = folder_path.split(os.sep)
+    for part in reversed(path_parts):
+        try:
+            metadata = extract_all_metadata(part)
+            if metadata.resolution:
+                return metadata.resolution
+        except Exception:
+            continue
+
+    return None
+
+def fetch_json(url: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    """
+    Fetch JSON data from a URL.
+
+    Args:
+        url: URL to fetch from
+        timeout: Request timeout in seconds
+
+    Returns:
+        JSON data as dictionary, None on error
+    """
+    try:
+        import requests
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        log_message(f"Error fetching JSON from {url}: {e}", level="ERROR")
+        return None
+
+def is_anime_file(filename):
+    """
+    Detect if the file is likely an anime file using intelligent pattern-based detection.
+
+    This function uses the new anime detection logic that doesn't rely on hardcoded
+    release group lists, but instead uses pattern-based detection for any group
+    in brackets that doesn't match common non-anime patterns.
+
+    Args:
+        filename (str): The filename to check
+
+    Returns:
+        bool: True if the file appears to be anime content, False otherwise
+    """
+    return is_anime_filename(filename)
+
+@lru_cache(maxsize=1)
+def get_anime_patterns():
+    """
+    Legacy function for backward compatibility.
+
+    This function is deprecated. Use is_anime_file() instead for intelligent
+    pattern-based anime detection without hardcoded release group lists.
+
+    Returns:
+        Compiled regex pattern that matches nothing (deprecated)
+    """
+    log_message("Warning: get_anime_patterns() is deprecated. Use is_anime_file() instead.", "WARNING")
+    return re.compile(r'(?!.*)', re.IGNORECASE)  # Pattern that never matches
