@@ -705,4 +705,4 @@ def is_extras_file(file: str, file_path: str, is_movie: bool = False) -> bool:
     Returns:
         bool: True if file should be skipped based on size limits or name patterns
     """
-    if not isinstance(file, str)
+    if not isinstance(file, str):
