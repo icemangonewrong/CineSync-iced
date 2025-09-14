@@ -529,3 +529,14 @@ def get_dashboard_timeout():
 def get_dashboard_retry_count():
     """Get number of retries for dashboard requests"""
     return get_env_int('DASHBOARD_RETRY_COUNT', 1)
+def get_upload_stability_wait():
+    """Get the time to wait for file size stability (seconds)"""
+    return get_env_int('UPLOAD_STABILITY_WAIT', 30)
+
+def get_upload_max_wait():
+    """Get the maximum time to wait for upload completion (seconds)"""
+    return get_env_int('UPLOAD_MAX_WAIT', 300)
+
+def get_upload_max_attempts():
+    """Get the maximum number of attempts to check for upload completion"""
+    return get_env_int('UPLOAD_MAX_ATTEMPTS', 10)
